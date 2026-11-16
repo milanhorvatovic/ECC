@@ -11,6 +11,24 @@ use super::output::{OutputStream, SessionOutputStore};
 use super::store::StateStore;
 use super::SessionState;
 
+const ACCOUNT_REDACTION_MARKER: &str = "[REDACTED]";
+
+fn redact_account_line(line: &str, secrets: &[&str]) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut remaining = line;
+    while let Some((offset, length)) = secrets
+        .iter()
+        .filter_map(|secret| remaining.find(secret).map(|offset| (offset, secret.len())))
+        .min_by_key(|(offset, length)| (*offset, std::cmp::Reverse(*length)))
+    {
+        result.push_str(&remaining[..offset]);
+        result.push_str(ACCOUNT_REDACTION_MARKER);
+        remaining = &remaining[offset + length..];
+    }
+    result.push_str(remaining);
+    result
+}
+
 type DbAck = std::result::Result<(), String>;
 
 enum DbMessage {
@@ -137,9 +155,28 @@ fn run_db_writer(db_path: PathBuf, session_id: String, mut rx: mpsc::UnboundedRe
 pub async fn capture_command_output(
     db_path: PathBuf,
     session_id: String,
+    command: Command,
+    output_store: SessionOutputStore,
+    heartbeat_interval: std::time::Duration,
+) -> Result<ExitStatus> {
+    capture_command_output_redacted(
+        db_path,
+        session_id,
+        command,
+        output_store,
+        heartbeat_interval,
+        Vec::new(),
+    )
+    .await
+}
+
+pub async fn capture_command_output_redacted(
+    db_path: PathBuf,
+    session_id: String,
     mut command: Command,
     output_store: SessionOutputStore,
     heartbeat_interval: std::time::Duration,
+    redactions: Vec<String>,
 ) -> Result<ExitStatus> {
     let db_writer = DbWriter::start(db_path, session_id.clone());
 
@@ -192,6 +229,7 @@ pub async fn capture_command_output(
             OutputStream::Stdout,
             output_store.clone(),
             db_writer.clone(),
+            redactions.clone(),
         ));
         let stderr_task = tokio::spawn(capture_stream(
             session_id.clone(),
@@ -199,6 +237,7 @@ pub async fn capture_command_output(
             OutputStream::Stderr,
             output_store,
             db_writer.clone(),
+            redactions,
         ));
 
         let status = child.wait().await?;
@@ -233,13 +272,22 @@ async fn capture_stream<R>(
     stream: OutputStream,
     output_store: SessionOutputStore,
     db_writer: DbWriter,
+    redactions: Vec<String>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
 
+    // Split multiline values too: lines are the capture boundary, before either store.
+    let mut secrets = redactions
+        .iter()
+        .flat_map(|value| value.lines())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
     while let Some(line) = lines.next_line().await? {
+        let line = redact_account_line(&line, &secrets);
         db_writer.append_output_line(stream, line.clone()).await?;
         output_store.push_line(&session_id, stream, line);
     }

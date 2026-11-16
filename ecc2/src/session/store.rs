@@ -24,6 +24,8 @@ use super::{
     SessionMetrics, SessionState, WorktreeInfo,
 };
 
+mod accounts;
+
 pub struct StateStore {
     conn: Connection,
 }
@@ -563,6 +565,19 @@ impl StateStore {
     }
 
     fn ensure_session_columns(&self) -> Result<()> {
+        for (column, kind) in [
+            ("account", "TEXT"),
+            ("account_pin", "TEXT"),
+            ("account_wait_worktree", "INTEGER"),
+        ] {
+            if !self.has_column("sessions", column)? {
+                self.conn.execute(
+                    &format!("ALTER TABLE sessions ADD COLUMN {column} {kind}"),
+                    [],
+                )?;
+            }
+        }
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS account_pool_cursors (harness TEXT PRIMARY KEY, account TEXT NOT NULL);")?;
         if !self.has_column("sessions", "working_dir")? {
             self.conn
                 .execute(

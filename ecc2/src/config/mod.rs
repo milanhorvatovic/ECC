@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod accounts;
+pub use accounts::{AccountConfig, AccountStrategy};
+
 use crate::notifications::{
     CompletionSummaryConfig, DesktopNotificationConfig, WebhookNotificationConfig,
 };
@@ -89,7 +92,7 @@ pub struct ResolvedAgentProfile {
     pub append_system_prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HarnessRunnerConfig {
     pub program: String,
@@ -108,6 +111,32 @@ pub struct HarnessRunnerConfig {
     pub append_system_prompt_flag: Option<String>,
     pub inline_system_prompt_for_task: bool,
     pub env: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for HarnessRunnerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HarnessRunnerConfig")
+            .field("program", &self.program)
+            .field("base_args", &self.base_args)
+            .field("project_markers", &self.project_markers)
+            .field("cwd_flag", &self.cwd_flag)
+            .field("session_name_flag", &self.session_name_flag)
+            .field("task_flag", &self.task_flag)
+            .field("model_flag", &self.model_flag)
+            .field("add_dir_flag", &self.add_dir_flag)
+            .field("include_directories_flag", &self.include_directories_flag)
+            .field("allowed_tools_flag", &self.allowed_tools_flag)
+            .field("disallowed_tools_flag", &self.disallowed_tools_flag)
+            .field("permission_mode_flag", &self.permission_mode_flag)
+            .field("max_budget_usd_flag", &self.max_budget_usd_flag)
+            .field("append_system_prompt_flag", &self.append_system_prompt_flag)
+            .field(
+                "inline_system_prompt_for_task",
+                &self.inline_system_prompt_for_task,
+            )
+            .field("env", &accounts::redacted_env(&self.env))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -230,6 +259,10 @@ pub struct Config {
     pub default_agent: String,
     pub default_agent_profile: Option<String>,
     pub harness_runners: BTreeMap<String, HarnessRunnerConfig>,
+    pub accounts: BTreeMap<String, AccountConfig>,
+    pub account_strategy: AccountStrategy,
+    #[serde(skip)]
+    pub requested_account: Option<String>,
     pub agent_profiles: BTreeMap<String, AgentProfileConfig>,
     pub orchestration_templates: BTreeMap<String, OrchestrationTemplateConfig>,
     pub memory_connectors: BTreeMap<String, MemoryConnectorConfig>,
@@ -297,6 +330,9 @@ impl Default for Config {
             default_agent: "claude".to_string(),
             default_agent_profile: None,
             harness_runners: BTreeMap::new(),
+            accounts: BTreeMap::new(),
+            account_strategy: AccountStrategy::default(),
+            requested_account: None,
             agent_profiles: BTreeMap::new(),
             orchestration_templates: BTreeMap::new(),
             memory_connectors: BTreeMap::new(),
@@ -323,6 +359,42 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn validate_accounts(&self) -> Result<()> {
+        for (name, account) in &self.accounts {
+            let harness = crate::session::HarnessKind::from_agent_type(&account.harness);
+            anyhow::ensure!(
+                harness != crate::session::HarnessKind::Unknown
+                    || self.harness_runner(&account.harness).is_some(),
+                "accounts.{name}: unknown harness"
+            );
+            anyhow::ensure!(
+                account
+                    .env
+                    .keys()
+                    .all(|key| !key.trim().is_empty() && !key.contains(['=', '\0']))
+                    && account.env.values().all(|value| !value.contains('\0')),
+                "accounts.{name}: invalid environment entry"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_account_pin(&self, harness: &str, pin: Option<&str>) -> Result<()> {
+        if let Some(name) = pin {
+            let account = self
+                .accounts
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown account {name} for harness {harness}"))?;
+            anyhow::ensure!(
+                crate::session::HarnessKind::canonical_agent_type(&account.harness)
+                    == crate::session::HarnessKind::canonical_agent_type(harness),
+                "Account {name} uses harness {}, session uses harness {harness}",
+                account.harness
+            );
+        }
+        Ok(())
+    }
+
     pub const RISK_THRESHOLDS: RiskThresholds = RiskThresholds {
         review: 0.35,
         confirm: 0.60,
@@ -512,9 +584,11 @@ impl Config {
             }
         }
 
-        merged
+        let config: Self = merged
             .try_into()
-            .context("deserialize merged ECC 2.0 config")
+            .context("deserialize merged ECC 2.0 config")?;
+        config.validate_accounts()?;
+        Ok(config)
     }
 
     #[cfg(test)]

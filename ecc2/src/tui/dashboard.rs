@@ -3039,10 +3039,10 @@ impl Dashboard {
         }
 
         self.refresh();
-        self.set_operator_note(format!(
-            "resumed session {}",
-            format_session_id(&session_id)
-        ));
+        self.set_operator_note(match manager::account_wait_message(&self.db, &session_id) {
+            Ok(Some(message)) => message,
+            _ => format!("resumed session {}", format_session_id(&session_id)),
+        });
     }
 
     pub async fn cleanup_selected_worktree(&mut self) {
@@ -15319,6 +15319,9 @@ diff --git a/src/lib.rs b/src/lib.rs
             default_agent: "claude".to_string(),
             default_agent_profile: None,
             harness_runners: Default::default(),
+            accounts: Default::default(),
+            account_strategy: Default::default(),
+            requested_account: None,
             agent_profiles: Default::default(),
             orchestration_templates: Default::default(),
             memory_connectors: Default::default(),
