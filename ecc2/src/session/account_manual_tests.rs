@@ -48,7 +48,10 @@ async fn account_uncovered_guard_successful_worktree_uses_effective_harness() ->
         cfg.accounts.get_mut("a").unwrap().harness = " Claude-Code ".into();
         let db = StateStore::open(&cfg.db_path)?;
         let runner = root.path().join("runner.sh");
-        fs::write(&runner, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.log\"\n")?;
+        fs::write(
+            &runner,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.log.tmp\" && mv \"$0.log.tmp\" \"$0.log\"\n",
+        )?;
         fs::set_permissions(&runner, fs::Permissions::from_mode(0o755))?;
         let profile = profile_agent.map(|agent: &str| SessionAgentProfile {
             agent: Some(agent.into()),
@@ -94,7 +97,10 @@ async fn account_uncovered_guard_resume_leaves_account_columns_untouched() -> Re
              BEGIN SELECT RAISE(ABORT, 'unexpected account reassignment'); END;",
         )?;
         let runner = root.path().join("runner.sh");
-        fs::write(&runner, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.log\"\n")?;
+        fs::write(
+            &runner,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.log.tmp\" && mv \"$0.log.tmp\" \"$0.log\"\n",
+        )?;
         fs::set_permissions(&runner, fs::Permissions::from_mode(0o755))?;
         let resumed = resume_session_with_program(&db, &cfg, &session.id, Some(&runner)).await?;
         assert_eq!(resumed, session.id);
@@ -165,7 +171,10 @@ async fn account_uncovered_harness_matches_no_table(entry: &str) -> Result<()> {
         );
         let db = StateStore::open(&cfg.db_path)?;
         let runner = root.path().join(format!("runner-{has_accounts}.sh"));
-        fs::write(&runner, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.log\"\n")?;
+        fs::write(
+            &runner,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.log.tmp\" && mv \"$0.log.tmp\" \"$0.log\"\n",
+        )?;
         fs::set_permissions(&runner, fs::Permissions::from_mode(0o755))?;
         let id = if entry == "start" {
             queue_session_in_dir_with_runner_program(
