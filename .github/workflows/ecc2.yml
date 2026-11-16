@@ -30,4 +30,9 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=${toolchain%% *}" >> "$GITHUB_ENV"
 
       - name: Test
+        env:
+          # Test fixtures push main from repositories created with git init.
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         run: cargo test --manifest-path ecc2/Cargo.toml --locked
