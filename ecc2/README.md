@@ -76,6 +76,78 @@ cargo run -- resume <session-id>
 cargo run -- daemon
 ```
 
+## Account Pools
+
+Configure subscription accounts in `ecc2.toml`. Each account names a built-in
+harness (except `unknown`) or a configured `harness_runners` entry. For example:
+
+```toml
+account_strategy = "least-busy"
+
+[accounts.personal]
+harness = "claude"
+max_parallel = 2
+env = { CLAUDE_CONFIG_DIR = "~/.claude-accounts/personal" }
+
+[accounts.work]
+harness = "claude"
+max_parallel = 3
+env = { CLAUDE_CONFIG_DIR = "~/.claude-accounts/work" }
+
+[accounts.code]
+harness = "codex"
+env = { CODEX_HOME = "~/.codex-accounts/work" }
+```
+
+Paths above are placeholders. Replace them with absolute paths: ecc2 passes
+environment values literally, without shell expansion. It never reads or copies
+files from account configuration directories. Account environment overrides
+runner environment when both set the same key. Config `Debug` output hides
+environment values, and captured stdout and stderr replace every non-empty account
+environment value with `[REDACTED]` before storing or broadcasting output. Empty
+values and empty lines of multiline values are skipped. Account `env` is for
+per-account values such as configuration paths: even a short common value such
+as `1` replaces matching output text. Constant flags shared by every account
+belong in `[harness_runners.<name>].env`; runner environment values are not added
+to account redaction patterns. Do not put credentials in tasks,
+account names, or other session metadata.
+
+`account_strategy` defaults to `least-busy`, which counts Pending and Running
+sessions per account. Ties use **account name order**, not file order, because
+the current TOML merge uses sorted maps. `round-robin` cycles in account name
+order; its last assignment is saved per harness in SQLite and survives restarts.
+Both strategies skip accounts at `max_parallel`; omit that field for no account
+limit. When every eligible account is full, the session stays Pending without
+spawning an agent or creating a worktree. `ecc status <session-id>` shows it
+waiting for an account. Run `ecc resume <session-id>` after capacity becomes
+available; if the pool is still full, resume reports that it is still waiting.
+Account waits survive restarts and require explicit resume. The daemon continues
+to service the ordinary worktree queue. Existing worktrees and agent edits stay
+on disk after an agent has spawned. See the [manual account tests](src/session/account_manual_tests.rs)
+and [base behavior comparisons](src/session/account_parity_tests.rs).
+Configurations without accounts keep their usual launch environment and behavior.
+A harness with no configured account runs as it would without accounts, unless an account is pinned.
+
+Pin a session with `ecc start --task "review changes" --agent claude --account work`.
+`--account` is accepted by `start`, `delegate`, `template`, `assign`, `drain-inbox`,
+`auto-dispatch`, `coordinate-backlog`, `maintain-coordination`, `rebalance-all`,
+`rebalance-team`, `resume`, `run-session`, `schedule run-due`, `remote run`,
+`daemon`, and the dashboard (also the default command). Other commands, including
+`status`, reject it. Unknown accounts and harness mismatches are errors. Explicit
+pins persist with the session; `resume --account` replaces the pin, while an
+automatically selected account is selected again on resume. A pin persists
+across restarts; the session waits for that account rather than using another
+free account. Removing that account, or changing its harness, makes resume
+return an error naming the account. If all accounts are removed, explicit resume
+starts unpinned account waits with the normal harness environment.
+`ecc status <session-id>` displays an `Account:`
+field, using `-` for sessions with no account.
+
+`rebalance-team` and `rebalance-all` can move unassigned intake handoffs between
+delegates on different accounts of the same harness. A handoff already assigned
+to a running or queued delegate stays with that delegate; running work never
+changes accounts.
+
 ## Bounded Harness Evaluation
 
 ECC2 now has an operator-driven configuration registry and promotion gate. Candidate JSON is canonicalized and addressed by its SHA-256 digest, with immutable trace/evidence references. Evaluation uses the same explicit unique seeds for candidate and active baseline through a pluggable Rust trait. The CLI exposes only a deterministic local recorded-measurements evaluator; it makes no network or process calls.

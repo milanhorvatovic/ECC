@@ -1,0 +1,38 @@
+name: ECC2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        working-directory: ecc2
+        shell: bash
+        run: |
+          toolchain="$(rustup show active-toolchain)"
+          echo "RUSTUP_TOOLCHAIN=${toolchain%% *}" >> "$GITHUB_ENV"
+
+      - name: Test
+        env:
+          # Test fixtures push main from repositories created with git init.
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
+        run: cargo test --manifest-path ecc2/Cargo.toml --locked

@@ -59,8 +59,106 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "ecc", version, about = "ECC 2.0 — Agentic IDE control plane")]
 struct Cli {
+    /// Pin newly started sessions to a configured subscription account
+    #[arg(long, global = true)]
+    account: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    fn parse() -> Self {
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    fn try_parse_from<I, T>(arguments: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let cli = <Self as clap::Parser>::try_parse_from(arguments)?;
+        let starts_sessions = matches!(
+            cli.command.as_ref(),
+            None | Some(
+                Commands::Dashboard
+                    | Commands::Daemon
+                    | Commands::Start { .. }
+                    | Commands::Delegate { .. }
+                    | Commands::Template { .. }
+                    | Commands::Assign { .. }
+                    | Commands::DrainInbox { .. }
+                    | Commands::AutoDispatch { .. }
+                    | Commands::CoordinateBacklog { .. }
+                    | Commands::MaintainCoordination { .. }
+                    | Commands::RebalanceAll { .. }
+                    | Commands::RebalanceTeam { .. }
+                    | Commands::Resume { .. }
+                    | Commands::RunSession { .. }
+                    | Commands::Schedule {
+                        command: ScheduleCommands::RunDue { .. }
+                    }
+                    | Commands::Remote {
+                        command: RemoteCommands::Run { .. }
+                    }
+            )
+        );
+        if cli.account.is_some() && !starts_sessions {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--account requires a command that starts sessions",
+            ));
+        }
+        Ok(cli)
+    }
+}
+
+#[cfg(test)]
+mod account_cli_tests {
+    use super::*;
+
+    #[test]
+    fn account_revision_cli_rejects_non_starting_commands() {
+        for arguments in [
+            vec!["ecc", "--account", "typo", "status"],
+            vec!["ecc", "sessions", "--account", "work"],
+            vec!["ecc", "--account", "work", "schedule", "list"],
+            vec!["ecc", "remote", "list", "--account", "work"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "ignored account flag: {arguments:?}");
+        }
+    }
+
+    #[test]
+    fn account_revision_cli_accepts_every_launch_entry_point() -> Result<()> {
+        for arguments in [
+            vec![], vec!["dashboard"], vec!["daemon"],
+            vec!["start", "--task", "task"], vec!["delegate", "lead"],
+            vec!["template", "example"], vec!["resume", "session"],
+            vec!["assign", "lead", "--task", "task"], vec!["drain-inbox", "lead"],
+            vec!["auto-dispatch"], vec!["coordinate-backlog"], vec!["maintain-coordination"],
+            vec!["rebalance-all"], vec!["rebalance-team", "lead"],
+            vec!["schedule", "run-due"], vec!["remote", "run"],
+            vec!["run-session", "--session-id", "session", "--task", "task", "--agent", "claude", "--cwd", "/repo"],
+        ] {
+            let mut command = vec!["ecc", "--account", "work"];
+            command.extend(arguments);
+            assert_eq!(Cli::try_parse_from(&command)?.account.as_deref(), Some("work"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn account_flag_is_available_to_session_start_commands() -> Result<()> {
+        for arguments in [
+            vec!["ecc", "start", "--task", "review", "--account", "work"],
+            vec!["ecc", "delegate", "lead", "--account", "work"],
+            vec!["ecc", "template", "review", "--account", "work"],
+            vec!["ecc", "resume", "latest", "--account", "work"],
+        ] {
+            assert_eq!(Cli::try_parse_from(arguments)?.account.as_deref(), Some("work"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(clap::Args, Debug, Clone, Default)]
@@ -1483,7 +1581,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let cfg = config::Config::load()?;
+    let mut cfg = config::Config::load()?;
+    cfg.requested_account = cli.account;
     let db = session::store::StateStore::open(&cfg.db_path)?;
 
     match cli.command {
@@ -1608,7 +1707,11 @@ async fn main() -> Result<()> {
                 let from_id = source.id;
                 send_handoff_message(&db, &from_id, &session_id)?;
             }
-            println!("Session started: {session_id}");
+            if let Some(message) = session::manager::account_wait_message(&db, &session_id)? {
+                println!("{message}");
+            } else {
+                println!("Session started: {session_id}");
+            }
         }
         Some(Commands::Delegate {
             from_session,
@@ -1646,11 +1749,15 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             send_handoff_message(&db, &source.id, &session_id)?;
-            println!(
-                "Delegated session started: {} <- {}",
-                session_id,
-                short_session(&source.id)
-            );
+            if let Some(message) = session::manager::account_wait_message(&db, &session_id)? {
+                println!("{message}");
+            } else {
+                println!(
+                    "Delegated session started: {} <- {}",
+                    session_id,
+                    short_session(&source.id)
+                );
+            }
         }
         Some(Commands::Template {
             name,
@@ -2650,7 +2757,11 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Resume { session_id }) => {
             let resumed_id = session::manager::resume_session(&db, &cfg, &session_id).await?;
-            println!("Session resumed: {resumed_id}");
+            if let Some(message) = session::manager::account_wait_message(&db, &resumed_id)? {
+                println!("{message}");
+            } else {
+                println!("Session resumed: {resumed_id}");
+            }
         }
         Some(Commands::Messages { command }) => match command {
             MessageCommands::Send {

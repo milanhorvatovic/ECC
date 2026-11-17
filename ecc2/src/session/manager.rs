@@ -163,6 +163,8 @@ pub fn get_status(db: &StateStore, cfg: &Config, id: &str) -> Result<SessionStat
     let session = resolve_session(db, id)?;
     let session_id = session.id.clone();
     Ok(SessionStatus {
+        account: db.session_account(&session.id)?,
+        waiting_for_account: db.account_wait_worktree(&session.id)?.is_some(),
         harness: db
             .get_session_harness_info(&session_id)?
             .unwrap_or_else(|| {
@@ -933,6 +935,7 @@ pub async fn drain_inbox(
         std::env::current_exe().context("Failed to resolve ECC executable path")?;
     let lead = resolve_session(db, lead_id)?;
     let repo_root = lead.working_dir.clone();
+    validate_assignment_account(db, cfg, agent_type, cfg.default_agent_profile.as_deref(), &lead, &repo_root)?;
     let messages = db.unread_task_handoffs_for_session(&lead.id, limit)?;
     let mut outcomes = Vec::new();
 
@@ -1083,6 +1086,7 @@ pub async fn rebalance_team_backlog(
         std::env::current_exe().context("Failed to resolve ECC executable path")?;
     let lead = resolve_session(db, lead_id)?;
     let repo_root = lead.working_dir.clone();
+    validate_assignment_account(db, cfg, agent_type, cfg.default_agent_profile.as_deref(), &lead, &repo_root)?;
     let mut outcomes = Vec::new();
 
     if limit == 0 {
@@ -1090,6 +1094,7 @@ pub async fn rebalance_team_backlog(
     }
 
     let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
+    let candidates = account_pinned_delegates(db, cfg, &delegates)?;
     let unread_counts = db.unread_message_counts()?;
     let team_has_capacity = delegates.len() < cfg.max_parallel_sessions;
 
@@ -1103,7 +1108,7 @@ pub async fn rebalance_team_backlog(
             continue;
         }
 
-        let has_clear_idle_elsewhere = delegates.iter().any(|candidate| {
+        let has_clear_idle_elsewhere = candidates.iter().any(|candidate| {
             candidate.id != delegate.id
                 && candidate.state == SessionState::Idle
                 && unread_counts.get(&candidate.id).copied().unwrap_or(0) == 0
@@ -1125,9 +1130,10 @@ pub async fn rebalance_team_backlog(
             }
 
             let current_delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
+            let current_candidates = account_pinned_delegates(db, cfg, &current_delegates)?;
             let current_unread_counts = db.unread_message_counts()?;
             let current_team_has_capacity = current_delegates.len() < cfg.max_parallel_sessions;
-            let current_has_clear_idle_elsewhere = current_delegates.iter().any(|candidate| {
+            let current_has_clear_idle_elsewhere = current_candidates.iter().any(|candidate| {
                 candidate.id != delegate.id
                     && candidate.state == SessionState::Idle
                     && current_unread_counts
@@ -1162,7 +1168,7 @@ pub async fn rebalance_team_backlog(
             )
             .await?;
 
-            if outcome.session_id == delegate.id {
+            if outcome.session_id == delegate.id || !assignment_action_routes_work(outcome.action) {
                 continue;
             }
 
@@ -1532,7 +1538,7 @@ pub async fn resume_session(db: &StateStore, cfg: &Config, id: &str) -> Result<S
 
 async fn resume_session_with_program(
     db: &StateStore,
-    _cfg: &Config,
+    cfg: &Config,
     id: &str,
     runner_executable_override: Option<&Path>,
 ) -> Result<String> {
@@ -1546,6 +1552,38 @@ async fn resume_session_with_program(
         anyhow::bail!("Session is already running: {}", session.id);
     }
 
+    if let Some(use_worktree) = db.account_wait_worktree(&session.id)? {
+        let ready = db.assign_session_account(
+            cfg,
+            &session.id,
+            &session.agent_type,
+            cfg.requested_account.as_deref(),
+            use_worktree,
+        )?;
+        db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
+        if !ready {
+            return Ok(session.id);
+        }
+        if use_worktree && session.worktree.is_none() {
+            if attached_worktree_count(db)? >= cfg.max_parallel_worktrees {
+                db.enqueue_pending_worktree(&session.id, &session.working_dir)?;
+                return Ok(session.id);
+            }
+            let worktree =
+                worktree::create_for_session_in_repo(&session.id, cfg, &session.working_dir)?;
+            db.attach_worktree(&session.id, &worktree)?;
+        }
+    } else if cfg.accounts.values().any(|account| {
+        HarnessKind::canonical_agent_type(&account.harness)
+            == HarnessKind::canonical_agent_type(&session.agent_type)
+    })
+        || cfg.requested_account.is_some()
+        || db.session_account_pin(&session.id)?.is_some()
+        || db.session_account(&session.id)?.is_some()
+    {
+        db.prepare_account_resume(cfg, &session.id, &session.agent_type)?;
+    }
+    let session = resolve_session(db, &session.id)?;
     db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
     if let Some(worktree) = session.worktree.as_ref() {
         if let Err(error) = worktree::sync_shared_dependency_dirs(worktree) {
@@ -1584,6 +1622,7 @@ async fn assign_session_in_dir_with_runner_program(
     grouping: SessionGrouping,
 ) -> Result<AssignmentOutcome> {
     let lead = resolve_session(db, lead_id)?;
+    validate_assignment_account(db, cfg, agent_type, profile_name, &lead, repo_root)?;
     let inherited_grouping = SessionGrouping {
         project: grouping
             .project
@@ -1593,7 +1632,8 @@ async fn assign_session_in_dir_with_runner_program(
             .or_else(|| normalize_group_label(&lead.task_group)),
     };
     let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
-    let delegate_handoff_backlog = delegates
+    let candidates = account_pinned_delegates(db, cfg, &delegates)?;
+    let delegate_handoff_backlog = candidates
         .iter()
         .map(|session| {
             db.unread_task_handoff_count(&session.id)
@@ -1601,7 +1641,7 @@ async fn assign_session_in_dir_with_runner_program(
         })
         .collect::<Result<std::collections::HashMap<_, _>>>()?;
 
-    if let Some(idle_delegate) = delegates
+    if let Some(idle_delegate) = candidates
         .iter()
         .filter(|session| {
             session.state == SessionState::Idle
@@ -1641,7 +1681,7 @@ async fn assign_session_in_dir_with_runner_program(
         });
     }
 
-    if let Some(_idle_delegate) = delegates
+    if let Some(_idle_delegate) = candidates
         .iter()
         .filter(|session| session.state == SessionState::Idle)
         .min_by_key(|session| {
@@ -1660,7 +1700,7 @@ async fn assign_session_in_dir_with_runner_program(
         });
     }
 
-    if let Some(active_delegate) = delegates
+    if let Some(active_delegate) = candidates
         .iter()
         .filter(|session| matches!(session.state, SessionState::Running | SessionState::Pending))
         .max_by_key(|session| {
@@ -1696,6 +1736,13 @@ async fn assign_session_in_dir_with_runner_program(
         return Ok(AssignmentOutcome {
             session_id: active_delegate.id.clone(),
             action: AssignmentAction::ReusedActive,
+        });
+    }
+
+    if cfg.requested_account.is_some() && delegates.len() >= cfg.max_parallel_sessions {
+        return Ok(AssignmentOutcome {
+            session_id: lead.id.clone(),
+            action: AssignmentAction::DeferredSaturated,
         });
     }
 
@@ -2429,7 +2476,7 @@ pub async fn run_session(
 
     let agent_program = agent_program(cfg, agent_type)?;
     let profile = db.get_session_profile(session_id)?;
-    let command = build_agent_command(
+    let mut command = build_agent_command(
         cfg,
         agent_type,
         &agent_program,
@@ -2438,12 +2485,54 @@ pub async fn run_session(
         working_dir,
         profile.as_ref(),
     );
-    capture_command_output(
+    let pin = db.session_account_pin(session_id)?;
+    if cfg.accounts.is_empty()
+        && cfg.requested_account.is_none()
+        && pin.is_none()
+        && db.session_account(session_id)?.is_none()
+    {
+        capture_command_output(
+            cfg.db_path.clone(),
+            session_id.to_string(),
+            command,
+            SessionOutputStore::default(),
+            std::time::Duration::from_secs(cfg.heartbeat_interval_secs),
+        )
+        .await?;
+        return Ok(());
+    }
+    let redactions = {
+        let requested = pin.as_deref().or(cfg.requested_account.as_deref());
+        cfg.validate_account_pin(agent_type, requested)?;
+        let assigned = db.session_account(session_id)?;
+        let valid_assignment = assigned
+            .as_deref()
+            .and_then(|name| cfg.accounts.get(name))
+            .is_some_and(|account| {
+                HarnessKind::canonical_agent_type(&account.harness)
+                    == HarnessKind::canonical_agent_type(agent_type)
+            });
+        if (!valid_assignment || cfg.requested_account.is_some())
+            && !db.assign_session_account(cfg, session_id, agent_type, requested, false)?
+        {
+            return Ok(());
+        }
+        let account = db.session_account(session_id)?;
+        match account.as_deref().and_then(|name| cfg.accounts.get(name)) {
+            Some(account) => {
+                command.envs(&account.env);
+                account.env.values().cloned().collect()
+            }
+            None => Vec::new(),
+        }
+    };
+    super::runtime::capture_command_output_redacted(
         cfg.db_path.clone(),
         session_id.to_string(),
         command,
         SessionOutputStore::default(),
         std::time::Duration::from_secs(cfg.heartbeat_interval_secs),
+        redactions,
     )
     .await?;
     Ok(())
@@ -2626,6 +2715,21 @@ async fn queue_session_with_resolved_profile_and_runner_program(
         .as_ref()
         .and_then(|profile| profile.agent.as_deref())
         .unwrap_or(agent_type);
+    let effective = effective_launch_agent(cfg, agent_type, profile.as_ref(), repo_root);
+    if cfg.requested_account.is_some()
+        || cfg.accounts.values().any(|account| {
+            HarnessKind::canonical_agent_type(&account.harness) == effective
+        })
+    {
+        cfg.validate_account_pin(&effective, cfg.requested_account.as_deref())?;
+        let session = build_session_record(db, task, &effective, false, cfg, repo_root, grouping)?;
+        db.insert_session(&session)?;
+        if let Some(profile) = profile.as_ref() {
+            db.upsert_session_profile(&session.id, profile)?;
+        }
+        return queue_account_session(db, cfg, session, use_worktree, repo_root, runner_program)
+            .await;
+    }
     let session = build_session_record(
         db,
         task,
@@ -2805,6 +2909,74 @@ fn attached_worktree_count(db: &StateStore) -> Result<usize> {
         .count())
 }
 
+pub fn account_wait_message(db: &StateStore, id: &str) -> Result<Option<String>> {
+    Ok(db.account_wait_worktree(id)?.map(|_| {
+        format!("Session waiting for an account: {id}. Run ecc resume {id} when capacity is free.")
+    }))
+}
+
+async fn queue_account_session(
+    db: &StateStore,
+    cfg: &Config,
+    session: Session,
+    use_worktree: bool,
+    repo_root: &Path,
+    runner_program: &Path,
+) -> Result<String> {
+    if !db.assign_session_account(
+        cfg,
+        &session.id,
+        &session.agent_type,
+        cfg.requested_account.as_deref(),
+        use_worktree,
+    )? {
+        return Ok(session.id);
+    }
+    if use_worktree {
+        if attached_worktree_count(db)? >= cfg.max_parallel_worktrees {
+            db.enqueue_pending_worktree(&session.id, repo_root)?;
+            return Ok(session.id);
+        }
+        let worktree = worktree::create_for_session_in_repo(&session.id, cfg, repo_root)?;
+        db.attach_worktree(&session.id, &worktree)?;
+    }
+    let session = resolve_session(db, &session.id)?;
+    match spawn_session_runner_for_program(
+        &session.task,
+        &session.id,
+        &session.agent_type,
+        &session.working_dir,
+        runner_program,
+    )
+    .await
+    {
+        Ok(()) => Ok(session.id),
+        Err(error) => {
+            db.update_state(&session.id, &SessionState::Failed)?;
+            if let Some(worktree) = session.worktree.as_ref() {
+                let _ = worktree::remove(worktree);
+            }
+            Err(error.context(format!("Failed to queue session {}", session.id)))
+        }
+    }
+}
+
+fn validate_assignment_account(
+    db: &StateStore,
+    cfg: &Config,
+    agent_type: &str,
+    profile_name: Option<&str>,
+    lead: &Session,
+    repo_root: &Path,
+) -> Result<()> {
+    if cfg.requested_account.is_none() {
+        return Ok(());
+    }
+    let profile = resolve_launch_profile(db, cfg, profile_name, Some(&lead.id))?;
+    let effective_agent = effective_launch_agent(cfg, agent_type, profile.as_ref(), repo_root);
+    cfg.validate_account_pin(&effective_agent, cfg.requested_account.as_deref())
+}
+
 fn merge_queue_priority(session: &Session) -> (u8, chrono::DateTime<chrono::Utc>) {
     let active_rank = match session.state {
         SessionState::Completed | SessionState::Failed | SessionState::Stopped => 0,
@@ -2870,6 +3042,44 @@ fn delegate_selection_key(db: &StateStore, session: &Session, task: &str) -> (us
     (
         graph_context_match_score(db, &session.id, task),
         -session.updated_at.timestamp_millis(),
+    )
+}
+
+fn account_pinned_delegates<'a>(
+    db: &StateStore,
+    cfg: &Config,
+    delegates: &'a [Session],
+) -> Result<Vec<&'a Session>> {
+    delegates
+        .iter()
+        .filter_map(|session| {
+            let matches = match cfg.requested_account.as_deref() {
+                Some(pin) => db
+                    .session_account(&session.id)
+                    .map(|account| account.as_deref() == Some(pin)),
+                None => Ok(true),
+            };
+            match matches {
+                Ok(true) => Some(Ok(session)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn effective_launch_agent(
+    cfg: &Config,
+    requested: &str,
+    profile: Option<&SessionAgentProfile>,
+    root: &Path,
+) -> String {
+    SessionHarnessInfo::resolve_requested_agent_type(
+        cfg,
+        profile
+            .and_then(|profile| profile.agent.as_deref())
+            .unwrap_or(requested),
+        root,
     )
 }
 
@@ -3664,6 +3874,8 @@ fn send_signal(pid: u32, signal: i32) -> Result<()> {
 }
 
 pub struct SessionStatus {
+    pub waiting_for_account: bool,
+    account: Option<String>,
     harness: SessionHarnessInfo,
     profile: Option<SessionAgentProfile>,
     session: Session,
@@ -3814,8 +4026,10 @@ pub fn preview_assignment_for_task(
     agent_type: &str,
 ) -> Result<AssignmentPreview> {
     let lead = resolve_session(db, lead_id)?;
+    validate_assignment_account(db, cfg, agent_type, None, &lead, &lead.working_dir)?;
     let delegates = direct_delegate_sessions(db, cfg, &lead, agent_type)?;
-    let delegate_handoff_backlog = delegates
+    let candidates = account_pinned_delegates(db, cfg, &delegates)?;
+    let delegate_handoff_backlog = candidates
         .iter()
         .map(|session| {
             db.unread_task_handoff_count(&session.id)
@@ -3823,7 +4037,7 @@ pub fn preview_assignment_for_task(
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
-    if let Some(idle_delegate) = delegates
+    if let Some(idle_delegate) = candidates
         .iter()
         .filter(|session| {
             session.state == SessionState::Idle
@@ -3854,7 +4068,7 @@ pub fn preview_assignment_for_task(
         });
     }
 
-    if let Some(idle_delegate) = delegates
+    if let Some(idle_delegate) = candidates
         .iter()
         .filter(|session| session.state == SessionState::Idle)
         .min_by_key(|session| {
@@ -3880,7 +4094,7 @@ pub fn preview_assignment_for_task(
         });
     }
 
-    if let Some(active_delegate) = delegates
+    if let Some(active_delegate) = candidates
         .iter()
         .filter(|session| matches!(session.state, SessionState::Running | SessionState::Pending))
         .max_by_key(|session| {
@@ -3913,7 +4127,11 @@ pub fn preview_assignment_for_task(
 
     Ok(AssignmentPreview {
         session_id: None,
-        action: AssignmentAction::Spawned,
+        action: if cfg.requested_account.is_none() || delegates.len() < cfg.max_parallel_sessions {
+            AssignmentAction::Spawned
+        } else {
+            AssignmentAction::DeferredSaturated
+        },
         delegate_state: None,
         handoff_backlog: 0,
         graph_match_terms: Vec::new(),
@@ -3997,6 +4215,10 @@ impl fmt::Display for SessionStatus {
         writeln!(f, "Session: {}", s.id)?;
         writeln!(f, "Task:    {}", s.task)?;
         writeln!(f, "Agent:   {}", s.agent_type)?;
+        writeln!(f, "Account: {}", self.account.as_deref().unwrap_or("-"))?;
+        if self.waiting_for_account {
+            writeln!(f, "Waiting for an account; run ecc resume {} when capacity is free", s.id)?;
+        }
         writeln!(f, "Harness: {}", self.harness.primary_label)?;
         writeln!(f, "Detected: {}", self.harness.detected_summary())?;
         writeln!(f, "State:   {}", s.state)?;
@@ -4240,6 +4462,11 @@ fn session_state_label(state: &SessionState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    include!("account_tests.rs");
+    include!("account_feature_tests.rs");
+    include!("account_parity_tests.rs");
+    include!("account_manual_tests.rs");
+
     use super::*;
     use crate::config::{Config, PaneLayout, Theme};
     use crate::session::{Session, SessionAgentProfile, SessionMetrics, SessionState};
@@ -4289,6 +4516,9 @@ mod tests {
             default_agent: "claude".to_string(),
             default_agent_profile: None,
             harness_runners: Default::default(),
+            accounts: Default::default(),
+            account_strategy: Default::default(),
+            requested_account: None,
             agent_profiles: Default::default(),
             orchestration_templates: Default::default(),
             memory_connectors: Default::default(),
