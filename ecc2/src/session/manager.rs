@@ -2486,7 +2486,11 @@ pub async fn run_session(
         profile.as_ref(),
     );
     let pin = db.session_account_pin(session_id)?;
-    if cfg.accounts.is_empty() && cfg.requested_account.is_none() && pin.is_none() {
+    if cfg.accounts.is_empty()
+        && cfg.requested_account.is_none()
+        && pin.is_none()
+        && db.session_account(session_id)?.is_none()
+    {
         capture_command_output(
             cfg.db_path.clone(),
             session_id.to_string(),
@@ -2498,8 +2502,8 @@ pub async fn run_session(
         return Ok(());
     }
     let redactions = {
-        cfg.validate_account_pin(agent_type, cfg.requested_account.as_deref())?;
         let requested = pin.as_deref().or(cfg.requested_account.as_deref());
+        cfg.validate_account_pin(agent_type, requested)?;
         let assigned = db.session_account(session_id)?;
         let valid_assignment = assigned
             .as_deref()
@@ -2514,7 +2518,6 @@ pub async fn run_session(
             return Ok(());
         }
         let account = db.session_account(session_id)?;
-        cfg.validate_account_pin(agent_type, pin.as_deref())?;
         match account.as_deref().and_then(|name| cfg.accounts.get(name)) {
             Some(account) => {
                 command.envs(&account.env);

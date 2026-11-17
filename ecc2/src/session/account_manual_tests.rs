@@ -575,6 +575,93 @@ async fn account_final_running_run_session_cannot_repin() -> Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn account_manual_run_session_clears_assignment_after_pool_removal() -> Result<()> {
+    let root = TestDir::new("run-session-removed-pool")?;
+    let mut cfg = account_pool_config(root.path());
+    let db = StateStore::open(&cfg.db_path)?;
+    account_record(&db, &cfg, "queued", root.path())?;
+    assert_eq!(db.session_account("queued")?.as_deref(), Some("a"));
+    assert_eq!(db.session_account_pin("queued")?, None);
+    cfg.accounts.clear();
+    let runner = root.path().join("runner.sh");
+    fs::write(
+        &runner,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$CLAUDE_CONFIG_DIR\" > \"$0.log.tmp\" && mv \"$0.log.tmp\" \"$0.log\"\nprintf '%s\\n' \"$CLAUDE_CONFIG_DIR\" placeholder-a\n",
+    )?;
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755))?;
+    cfg.harness_runners.insert(
+        "claude".into(),
+        crate::config::HarnessRunnerConfig {
+            program: runner.to_string_lossy().into_owned(),
+            env: BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "runner-default".into())]),
+            ..Default::default()
+        },
+    );
+    run_session(&cfg, "queued", "task", "claude", root.path()).await?;
+    let log = wait_for_file(&runner.with_extension("sh.log"))?;
+    assert_eq!(log.lines().last(), Some("runner-default"));
+    assert_eq!(
+        db.get_output_lines("queued", 10)?
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>(),
+        ["runner-default", "placeholder-a"]
+    );
+    assert_eq!(
+        db.get_session("queued")?.unwrap().state,
+        SessionState::Completed
+    );
+    assert_eq!(db.session_account("queued")?, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn account_manual_run_session_stored_pin_overrides_other_harness_process_pin() -> Result<()> {
+    let root = TestDir::new("run-session-stored-pin")?;
+    let mut cfg = account_pool_config(root.path());
+    cfg.requested_account = Some("a".into());
+    let db = StateStore::open(&cfg.db_path)?;
+    account_record(&db, &cfg, "queued", root.path())?;
+    assert_eq!(db.session_account_pin("queued")?.as_deref(), Some("a"));
+    cfg.accounts.insert(
+        "codex-work".into(),
+        crate::config::AccountConfig {
+            harness: "codex".into(),
+            env: BTreeMap::from([("CODEX_HOME".into(), "placeholder-codex".into())]),
+            max_parallel: Some(1),
+        },
+    );
+    cfg.requested_account = Some("codex-work".into());
+    let runner = root.path().join("runner.sh");
+    fs::write(
+        &runner,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$CLAUDE_CONFIG_DIR\" \"$CODEX_HOME\" > \"$0.log.tmp\" && mv \"$0.log.tmp\" \"$0.log\"\n",
+    )?;
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755))?;
+    cfg.harness_runners.insert(
+        "claude".into(),
+        crate::config::HarnessRunnerConfig {
+            program: runner.to_string_lossy().into_owned(),
+            env: BTreeMap::from([
+                ("CLAUDE_CONFIG_DIR".into(), "runner-default".into()),
+                ("CODEX_HOME".into(), "runner-codex".into()),
+            ]),
+            ..Default::default()
+        },
+    );
+    run_session(&cfg, "queued", "task", "claude", root.path()).await?;
+    let log = wait_for_file(&runner.with_extension("sh.log"))?;
+    assert!(log.ends_with("\nplaceholder-a\nrunner-codex\n"), "{log}");
+    assert_eq!(db.session_account("queued")?.as_deref(), Some("a"));
+    assert_eq!(db.session_account_pin("queued")?.as_deref(), Some("a"));
+    assert_eq!(
+        db.get_session("queued")?.unwrap().state,
+        SessionState::Completed
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn account_manual_changed_harness_is_reselected_before_spawn() -> Result<()> {
     let root = TestDir::new("changed-account-harness")?;
     let mut cfg = account_pool_config(root.path());
