@@ -13,6 +13,15 @@ use super::SessionState;
 
 const ACCOUNT_REDACTION_MARKER: &str = "[REDACTED]";
 
+pub(crate) fn redact_account_text(text: &str, values: &[String]) -> String {
+    let secrets = values
+        .iter()
+        .flat_map(|value| value.lines())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    redact_account_line(text, &secrets)
+}
+
 fn redact_account_line(line: &str, secrets: &[&str]) -> String {
     let mut result = String::with_capacity(line.len());
     let mut remaining = line;
@@ -56,9 +65,9 @@ struct DbWriter {
 }
 
 impl DbWriter {
-    fn start(db_path: PathBuf, session_id: String) -> Self {
+    fn start(db: Result<StateStore>, session_id: String) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        std::thread::spawn(move || run_db_writer(db_path, session_id, rx));
+        std::thread::spawn(move || run_db_writer(db, session_id, rx));
         Self { tx }
     }
 
@@ -96,8 +105,8 @@ impl DbWriter {
     }
 }
 
-fn run_db_writer(db_path: PathBuf, session_id: String, mut rx: mpsc::UnboundedReceiver<DbMessage>) {
-    let (opened, open_error) = match StateStore::open(&db_path) {
+fn run_db_writer(db: Result<StateStore>, session_id: String, mut rx: mpsc::UnboundedReceiver<DbMessage>) {
+    let (opened, open_error) = match db {
         Ok(db) => (Some(db), None),
         Err(error) => (None, Some(error.to_string())),
     };
@@ -178,14 +187,21 @@ pub async fn capture_command_output_redacted(
     heartbeat_interval: std::time::Duration,
     redactions: Vec<String>,
 ) -> Result<ExitStatus> {
-    let db_writer = DbWriter::start(db_path, session_id.clone());
+    let db = StateStore::open(&db_path);
+    let child = match db.as_ref() {
+        Ok(db) => db.start_template_harness(&session_id, || {
+            command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("Failed to start process for session {}", session_id))
+        }),
+        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+    };
+    let db_writer = DbWriter::start(db, session_id.clone());
 
     let result = async {
-        let mut child = command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("Failed to start process for session {}", session_id))?;
+        let mut child = child?;
 
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,

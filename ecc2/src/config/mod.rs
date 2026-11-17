@@ -156,6 +156,8 @@ pub struct OrchestrationTemplateConfig {
 pub struct OrchestrationTemplateStepConfig {
     pub name: Option<String>,
     pub task: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
     pub agent: Option<String>,
     pub profile: Option<String>,
     pub worktree: Option<bool>,
@@ -237,12 +239,17 @@ pub struct ResolvedOrchestrationTemplate {
 pub struct ResolvedOrchestrationTemplateStep {
     pub name: String,
     pub task: String,
+    #[serde(default)]
+    pub after: Vec<String>,
     pub agent: Option<String>,
     pub profile: Option<String>,
     pub worktree: bool,
     pub project: Option<String>,
     pub task_group: Option<String>,
 }
+
+#[cfg(test)]
+mod template_dependency_tests;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -461,6 +468,13 @@ impl Config {
         self.harness_runners.get(&key)
     }
 
+    pub(crate) fn account_env_values(&self) -> Vec<String> {
+        self.accounts
+            .values()
+            .flat_map(|account| account.env.values().cloned())
+            .collect()
+    }
+
     pub fn resolve_orchestration_template(
         &self,
         name: &str,
@@ -509,6 +523,14 @@ impl Config {
             steps.push(ResolvedOrchestrationTemplateStep {
                 name: step_name,
                 task,
+                after: step
+                    .after
+                    .iter()
+                    .map(|dependency| {
+                        interpolate_required_string(dependency, vars)
+                            .map(|name| name.trim().to_string())
+                    })
+                    .collect::<Result<Vec<_>>>()?,
                 agent,
                 profile,
                 worktree: step
@@ -526,6 +548,7 @@ impl Config {
             });
         }
 
+        validate_template_dependencies(name, &steps)?;
         Ok(ResolvedOrchestrationTemplate {
             template_name: name.to_string(),
             description,
@@ -588,7 +611,47 @@ impl Config {
             .try_into()
             .context("deserialize merged ECC 2.0 config")?;
         config.validate_accounts()?;
+        config.validate_literal_template_dependencies()?;
         Ok(config)
+    }
+
+    fn validate_literal_template_dependencies(&self) -> Result<()> {
+        for (name, template) in &self.orchestration_templates {
+            // Variable names require launch-time resolution; task variables do not.
+            if template.steps.iter().any(|step| {
+                step.name.as_deref().is_some_and(|name| name.contains("{{"))
+                    || step.after.iter().any(|name| name.contains("{{"))
+            }) {
+                continue;
+            }
+            let steps = template
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| ResolvedOrchestrationTemplateStep {
+                    name: step
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| format!("step {}", index + 1)),
+                    task: String::new(),
+                    after: step
+                        .after
+                        .iter()
+                        .map(|name| name.trim().to_string())
+                        .collect(),
+                    agent: None,
+                    profile: None,
+                    worktree: false,
+                    project: None,
+                    task_group: None,
+                })
+                .collect::<Vec<_>>();
+            validate_template_dependencies(name, &steps)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -955,6 +1018,74 @@ where
             base.push(value.clone());
         }
     }
+}
+
+fn validate_template_dependencies(
+    template: &str,
+    steps: &[ResolvedOrchestrationTemplateStep],
+) -> Result<()> {
+    let mut edges = vec![Vec::new(); steps.len()];
+    for (index, step) in steps.iter().enumerate() {
+        let mut seen = std::collections::HashSet::new();
+        for dependency in &step.after {
+            if !seen.insert(dependency) {
+                anyhow::bail!(
+                    "orchestration template {template} step {}: duplicate prerequisite {dependency}",
+                    step.name
+                );
+            }
+            let matches = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.name == *dependency)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let target = match matches.as_slice() {
+                [] => anyhow::bail!(
+                    "orchestration template {template} step {}: unknown step {dependency}",
+                    step.name
+                ),
+                [target] => *target,
+                _ => anyhow::bail!(
+                    "orchestration template {template} step {}: ambiguous step {dependency}",
+                    step.name
+                ),
+            };
+            if target == index {
+                anyhow::bail!(
+                    "orchestration template {template} step {}: cannot run after itself",
+                    step.name
+                );
+            }
+            edges[index].push(target);
+        }
+    }
+
+    // Iterative traversal also bounds the call stack for operator-supplied graphs.
+    let mut colors = vec![0; steps.len()];
+    for root in 0..steps.len() {
+        let mut stack = vec![(root, false)];
+        while let Some((index, exiting)) = stack.pop() {
+            if exiting {
+                colors[index] = 2;
+                continue;
+            }
+            match colors[index] {
+                2 => continue,
+                1 => anyhow::bail!(
+                    "orchestration template {template} step {}: dependency cycle",
+                    steps[index].name
+                ),
+                _ => {}
+            }
+            colors[index] = 1;
+            stack.push((index, true));
+            for &target in edges[index].iter().rev() {
+                stack.push((target, false));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn interpolate_optional_string(
