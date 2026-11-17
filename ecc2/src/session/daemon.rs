@@ -51,6 +51,10 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
             tracing::error!("Queued worktree activation pass failed: {e}");
         }
 
+        if let Err(e) = manager::activate_ready_template_steps(&db, &cfg).await {
+            tracing::error!("Template dependency activation pass failed: {e}");
+        }
+
         time::sleep(heartbeat_interval).await;
     }
 }

@@ -23,6 +23,9 @@ use crate::config::Config;
 use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
 use crate::worktree;
 
+mod templates;
+pub use templates::activate_ready_template_steps;
+
 pub async fn create_session(
     db: &StateStore,
     cfg: &Config,
@@ -156,13 +159,37 @@ async fn run_due_schedules_with_runner_program(
 }
 
 pub fn list_sessions(db: &StateStore) -> Result<Vec<Session>> {
-    db.list_sessions()
+    let mut sessions = db.list_sessions()?;
+    sessions.extend(db.waiting_template_sessions()?);
+    Ok(sessions)
 }
 
 pub fn get_status(db: &StateStore, cfg: &Config, id: &str) -> Result<SessionStatus> {
-    let session = resolve_session(db, id)?;
+    let session = match resolve_session(db, id) {
+        Ok(session) => session,
+        Err(error) => db
+            .waiting_template_sessions()?
+            .into_iter()
+            .find(|session| session.id == id || session.id.starts_with(id))
+            .ok_or(error)?,
+    };
     let session_id = session.id.clone();
+    let waiting_for_template = db.template_wait_reason(&session_id)?;
+    if waiting_for_template.is_some() && db.get_session(&session_id)?.is_none() {
+        return Ok(SessionStatus {
+            account: None,
+            waiting_for_account: false,
+            waiting_for_template,
+            harness: SessionHarnessInfo::detect(&session.agent_type, &session.working_dir)
+                .with_config_detection(cfg, &session.working_dir),
+            profile: db.template_step(&session_id)?.and_then(|step| step.profile),
+            session,
+            parent_session: None,
+            delegated_children: Vec::new(),
+        });
+    }
     Ok(SessionStatus {
+        waiting_for_template,
         account: db.session_account(&session.id)?,
         waiting_for_account: db.account_wait_worktree(&session.id)?.is_some(),
         harness: db
@@ -635,6 +662,18 @@ pub async fn launch_orchestration_template(
         .transpose()?;
     let vars = build_template_variables(&repo_root, source_session.as_ref(), task, variables);
     let template = cfg.resolve_orchestration_template(template_name, &vars)?;
+    if template.steps.iter().any(|step| !step.after.is_empty()) {
+        return templates::launch(
+            db,
+            cfg,
+            &template,
+            source_session.as_ref(),
+            task,
+            &repo_root,
+            &runner_program,
+        )
+        .await;
+    }
     let live_sessions = db
         .list_sessions()?
         .into_iter()
@@ -1544,6 +1583,10 @@ async fn resume_session_with_program(
 ) -> Result<String> {
     let session = resolve_session(db, id)?;
 
+    if let Some(reason) = db.template_blocked_reason(&session.id)? {
+        anyhow::bail!("Template blocked: {reason}; this step will not start");
+    }
+
     if session.state == SessionState::Completed {
         anyhow::bail!("Completed sessions cannot be resumed: {}", session.id);
     }
@@ -1584,7 +1627,11 @@ async fn resume_session_with_program(
         db.prepare_account_resume(cfg, &session.id, &session.agent_type)?;
     }
     let session = resolve_session(db, &session.id)?;
-    db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
+    if db.template_step(&session.id)?.is_some() {
+        db.release_template_runtime(&session.id)?;
+    } else {
+        db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
+    }
     if let Some(worktree) = session.worktree.as_ref() {
         if let Err(error) = worktree::sync_shared_dependency_dirs(worktree) {
             tracing::warn!(
@@ -2378,12 +2425,18 @@ fn classify_merge_queue_report(
 }
 
 pub async fn delete_session(db: &StateStore, id: &str) -> Result<()> {
-    let session = resolve_session(db, id)?;
+    let session = resolve_session(db, id).or_else(|error| {
+        db.waiting_template_sessions()?
+            .into_iter()
+            .find(|session| session.id == id || session.id.starts_with(id))
+            .ok_or(error)
+    })?;
 
     if matches!(
         session.state,
         SessionState::Pending | SessionState::Running | SessionState::Idle
     ) {
+        db.check_template_session_delete(&session.id)?;
         anyhow::bail!(
             "Cannot delete active session {} while it is {}",
             session.id,
@@ -2391,11 +2444,10 @@ pub async fn delete_session(db: &StateStore, id: &str) -> Result<()> {
         );
     }
 
+    db.delete_session(&session.id)?;
     if let Some(worktree) = session.worktree.as_ref() {
         let _ = crate::worktree::remove(worktree);
     }
-
-    db.delete_session(&session.id)?;
     Ok(())
 }
 
@@ -2474,7 +2526,32 @@ pub async fn run_session(
         return Ok(());
     }
 
-    let agent_program = agent_program(cfg, agent_type)?;
+    let template_step = db.template_step(session_id)?;
+    if let Some(step) = &template_step {
+        if !templates::prepare_runtime(&db, cfg, step)? {
+            return Ok(());
+        }
+    }
+    let session = resolve_session(&db, session_id)?;
+    let (task, agent_type, working_dir) = if template_step.is_some() {
+        (
+            session.task.as_str(),
+            session.agent_type.as_str(),
+            session.working_dir.as_path(),
+        )
+    } else {
+        (task, agent_type, working_dir)
+    };
+
+    let agent_program = match agent_program(cfg, agent_type) {
+        Ok(program) => program,
+        Err(error) => {
+            if template_step.is_some() {
+                db.update_state_and_pid(session_id, &SessionState::Failed, None)?;
+            }
+            return Err(error);
+        }
+    };
     let profile = db.get_session_profile(session_id)?;
     let mut command = build_agent_command(
         cfg,
@@ -2512,7 +2589,8 @@ pub async fn run_session(
                 HarnessKind::canonical_agent_type(&account.harness)
                     == HarnessKind::canonical_agent_type(agent_type)
             });
-        if (!valid_assignment || cfg.requested_account.is_some())
+        if template_step.is_none()
+            && (!valid_assignment || cfg.requested_account.is_some())
             && !db.assign_session_account(cfg, session_id, agent_type, requested, false)?
         {
             return Ok(());
@@ -3160,7 +3238,7 @@ fn summarize_backlog_pressure(
     Ok(summary)
 }
 
-fn send_task_handoff(
+pub(super) fn send_task_handoff(
     db: &StateStore,
     from_session: &Session,
     to_session_id: &str,
@@ -3814,7 +3892,15 @@ async fn stop_session_with_options(
     id: &str,
     cleanup_worktree: bool,
 ) -> Result<()> {
-    let session = resolve_session(db, id)?;
+    let session = resolve_session(db, id).or_else(|error| {
+        db.waiting_template_sessions()?
+            .into_iter()
+            .find(|session| session.id == id || session.id.starts_with(id))
+            .ok_or(error)
+    })?;
+    if db.stop_waiting_template_step(&session.id)? {
+        return Ok(());
+    }
     stop_session_recorded(db, &session, cleanup_worktree)
 }
 
@@ -3875,6 +3961,7 @@ fn send_signal(pid: u32, signal: i32) -> Result<()> {
 
 pub struct SessionStatus {
     pub waiting_for_account: bool,
+    waiting_for_template: Option<String>,
     account: Option<String>,
     harness: SessionHarnessInfo,
     profile: Option<SessionAgentProfile>,
@@ -4219,6 +4306,9 @@ impl fmt::Display for SessionStatus {
         if self.waiting_for_account {
             writeln!(f, "Waiting for an account; run ecc resume {} when capacity is free", s.id)?;
         }
+        if let Some(waiting) = &self.waiting_for_template {
+            writeln!(f, "{waiting}")?;
+        }
         writeln!(f, "Harness: {}", self.harness.primary_label)?;
         writeln!(f, "Detected: {}", self.harness.detected_summary())?;
         writeln!(f, "State:   {}", s.state)?;
@@ -4466,6 +4556,8 @@ mod tests {
     include!("account_feature_tests.rs");
     include!("account_parity_tests.rs");
     include!("account_manual_tests.rs");
+    include!("template_tests.rs");
+    include!("template_regression_tests.rs");
 
     use super::*;
     use crate::config::{Config, PaneLayout, Theme};

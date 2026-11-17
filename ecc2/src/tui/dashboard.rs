@@ -12920,6 +12920,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                     crate::config::OrchestrationTemplateStepConfig {
                         name: Some("planner".to_string()),
                         task: "Plan {{task}}".to_string(),
+                        after: Vec::new(),
                         project: None,
                         task_group: None,
                         agent: None,
@@ -12929,6 +12930,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                     crate::config::OrchestrationTemplateStepConfig {
                         name: Some("builder".to_string()),
                         task: "Build {{task}} in {{component}}".to_string(),
+                        after: Vec::new(),
                         project: None,
                         task_group: None,
                         agent: None,
@@ -12978,6 +12980,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                     crate::config::OrchestrationTemplateStepConfig {
                         name: Some("planner".to_string()),
                         task: "Plan {{task}}".to_string(),
+                        after: Vec::new(),
                         project: None,
                         task_group: None,
                         agent: None,
@@ -12987,6 +12990,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                     crate::config::OrchestrationTemplateStepConfig {
                         name: Some("builder".to_string()),
                         task: "Build {{task}} in {{component}}".to_string(),
+                        after: Vec::new(),
                         project: None,
                         task_group: None,
                         agent: None,

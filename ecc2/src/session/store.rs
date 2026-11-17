@@ -25,6 +25,7 @@ use super::{
 };
 
 mod accounts;
+pub(crate) mod templates;
 
 pub struct StateStore {
     conn: Connection,
@@ -544,6 +545,7 @@ impl StateStore {
             ",
         )?;
         self.ensure_session_columns()?;
+        self.ensure_template_step_schema()?;
         self.ensure_message_columns()?;
         self.ensure_harness_eval_columns()?;
         self.ensure_harness_candidate_aliases()?;
@@ -2642,6 +2644,11 @@ impl StateStore {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        self.check_template_session_delete(session_id)?;
         self.conn.execute(
             "DELETE FROM session_output WHERE session_id = ?1",
             rusqlite::params![session_id],
@@ -2660,11 +2667,19 @@ impl StateStore {
             rusqlite::params![session_id],
         )?;
 
-        if deleted == 0 {
+        // Keep the blocked definition as a tombstone for its descendants, but
+        // remove the virtual session from listings just like a deleted real row.
+        let deleted_waiting = self.conn.execute(
+            "UPDATE template_steps SET phase = 'queued'
+             WHERE session_id = ?1 AND phase = 'waiting' AND blocked_reason IS NOT NULL",
+            [session_id],
+        )?;
+        if deleted == 0 && deleted_waiting == 0 {
             anyhow::bail!("Session not found: {session_id}");
         }
 
         self.refresh_session_board_meta()?;
+        tx.commit()?;
         Ok(())
     }
 

@@ -103,8 +103,9 @@ Paths above are placeholders. Replace them with absolute paths: ecc2 passes
 environment values literally, without shell expansion. It never reads or copies
 files from account configuration directories. Account environment overrides
 runner environment when both set the same key. Config `Debug` output hides
-environment values, and captured stdout and stderr replace every non-empty account
-environment value with `[REDACTED]` before storing or broadcasting output. Empty
+environment values, and captured stdout and stderr replace every non-empty
+environment value of the assigned account with `[REDACTED]` before storing or
+broadcasting output. Empty
 values and empty lines of multiline values are skipped. Account `env` is for
 per-account values such as configuration paths: even a short common value such
 as `1` replaces matching output text. Constant flags shared by every account
@@ -147,6 +148,92 @@ field, using `-` for sessions with no account.
 delegates on different accounts of the same harness. A handoff already assigned
 to a running or queued delegate stays with that delegate; running work never
 changes accounts.
+
+## Sequential Templates
+
+A template step can name its prerequisites with `after`. Names refer to the
+resolved names in the same template, including interpolated names and the default
+`step 1`, `step 2`, and so on. Unknown, self-referencing, ambiguous, and cyclic
+dependencies, including duplicate prerequisites, are rejected with the template
+and step named in the error.
+Literal dependency graphs are also checked when configuration loads; graphs
+with variable names are checked after interpolation at launch.
+
+```toml
+[orchestration_templates.audit]
+worktree = false
+
+[[orchestration_templates.audit.steps]]
+name = "inspect"
+agent = "claude"
+task = "Inspect /path/to/repository and describe its main risks."
+
+[[orchestration_templates.audit.steps]]
+name = "review"
+agent = "codex"
+after = ["inspect"]
+task = "Review the reported risks against /path/to/repository."
+```
+
+The paths are placeholders. Run `ecc template audit` with the daemon running.
+Only root steps queue immediately. Each later step queues after every named
+prerequisite reaches Completed. Each step keeps its own agent, profile, allowed
+tools, permission mode, and harness account pool. Templates with no `after`
+continue to queue every step at launch with the existing whole-template slot
+check and anchor handoffs.
+
+Each named prerequisite contributes its captured text output to the later
+step's task. The source is the output already kept in SQLite, subject to the
+output ring's retention. Each contribution keeps the last 16 KiB of UTF-8 text
+(`TEMPLATE_RESULT_MAX_BYTES` in `src/session/store/templates.rs`), with framing
+outside that limit, cut forward to a UTF-8 boundary, with a visible note when
+earlier output was truncated by the byte limit or the output ring is full.
+It is labelled with the earlier step's name and
+explicitly marked as untrusted data that must not override the step's own task,
+tools, or permissions. Result framing and account redaction are covered by the
+[sequential regression tests](src/session/template_regression_tests.rs).
+Capture redacts only the assigned account's environment values,
+as described under Account Pools. Result passing redacts every configured
+account's environment values across all harnesses before truncation. The passed
+block, including its label, boundary, and joins, is redacted at the result
+boundary. Values supplied in template configuration and launch variables retain
+the same storage and display behavior as templates without `after`; redaction
+does not change a step's own task, effective profile, or permissions. This passes
+text; it does not base a later worktree on an earlier step's branch.
+
+If a step ends Failed or Stopped, its direct and transitive dependents never
+start. The blocked record persists even if that earlier session is resumed.
+`ecc status <step-session-id>` identifies the failed or stopped prerequisite;
+it also shows the prerequisites of a step that is still waiting.
+The [blocked-step regression tests](src/session/template_regression_tests.rs)
+cover resume refusal and listing and deletion of steps that never queued.
+Run `ecc stop <step-session-id>` to cancel a waiting step before it starts.
+For an unblocked waiting step, status then identifies it as Stopped, and its
+dependents stay blocked. Stopping an already blocked step preserves the
+prerequisite named in its status.
+
+Deleting a prerequisite or handoff anchor is refused while an unstarted,
+unblocked step still needs it, including the launch source or root anchor used
+by later descendants. The refusal names a waiting step. Deletion is available
+again after all consumers have started or become blocked.
+
+The CLI and manager launch check count only root steps against free session
+slots. A later step that is ready while all slots are occupied waits for a slot;
+the daemon checks readiness each heartbeat and respects `max_parallel_sessions`.
+The dashboard retains its whole-template capacity pre-check. Worktree capacity
+and account limits still apply; a full account pool requires explicit resume,
+as described under Account Pools.
+
+Waiting definitions and claimed Pending sessions persist in SQLite. Claiming a
+step and creating its session share one transaction. A separate database claim
+before a runner starts the harness prevents duplicate execution when a Pending
+session is delivered again. Restarting the daemon therefore resumes waiting
+chains, including prerequisites that completed while it was offline, without
+creating a second session for a step. Existing crashed-session handling still
+marks a lost running process Failed; it does not retry the step. The final
+prerequisite check and harness spawn share a database write lock with failure
+propagation. A step's activation error is recorded in its status while other
+steps continue through the activation pass.
 
 ## Bounded Harness Evaluation
 
