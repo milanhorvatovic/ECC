@@ -655,12 +655,33 @@ pub async fn launch_orchestration_template(
 ) -> Result<TemplateLaunchOutcome> {
     let repo_root =
         std::env::current_dir().context("Failed to resolve current working directory")?;
+    launch_orchestration_template_in_dir(
+        db,
+        cfg,
+        template_name,
+        source_session_id,
+        task,
+        variables,
+        &repo_root,
+    )
+    .await
+}
+
+async fn launch_orchestration_template_in_dir(
+    db: &StateStore,
+    cfg: &Config,
+    template_name: &str,
+    source_session_id: Option<&str>,
+    task: Option<&str>,
+    variables: BTreeMap<String, String>,
+    repo_root: &Path,
+) -> Result<TemplateLaunchOutcome> {
     let runner_program =
         std::env::current_exe().context("Failed to resolve ECC executable path")?;
     let source_session = source_session_id
         .map(|id| resolve_session(db, id))
         .transpose()?;
-    let vars = build_template_variables(&repo_root, source_session.as_ref(), task, variables);
+    let vars = build_template_variables(repo_root, source_session.as_ref(), task, variables);
     let template = cfg.resolve_orchestration_template(template_name, &vars)?;
     if template.steps.iter().any(|step| !step.after.is_empty()) {
         return templates::launch(
@@ -669,7 +690,7 @@ pub async fn launch_orchestration_template(
             &template,
             source_session.as_ref(),
             task,
-            &repo_root,
+            repo_root,
             &runner_program,
         )
         .await;
@@ -705,7 +726,7 @@ pub async fn launch_orchestration_template(
             source_session
                 .as_ref()
                 .map(|session| session.project.clone())
-                .unwrap_or_else(|| default_project_label(&repo_root)),
+                .unwrap_or_else(|| default_project_label(repo_root)),
         ),
         task_group: Some(
             source_session
@@ -747,7 +768,7 @@ pub async fn launch_orchestration_template(
             &step.task,
             &agent,
             step.worktree,
-            &repo_root,
+            repo_root,
             &runner_program,
             profile,
             grouping,
@@ -5725,7 +5746,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn run_due_schedules_dispatches_due_tasks_and_advances_next_run() -> Result<()> {
+        // The runner inherits the process directory until its first log write.
+        let _cwd_lock = crate::test_support::lock_current_dir();
         let tempdir = TestDir::new("manager-run-due-schedules")?;
         let repo_root = tempdir.path().join("repo");
         init_git_repo(&repo_root)?;

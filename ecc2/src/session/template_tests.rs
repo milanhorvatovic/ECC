@@ -114,9 +114,16 @@ async fn sequential_no_after_queues_every_step_at_once() -> Result<()> {
     }
     cfg.max_parallel_worktrees = 0;
     let db = StateStore::open(&cfg.db_path)?;
-    let _cwd_guard = crate::test_support::CurrentDirGuard::enter(root.path())?;
-    let launch =
-        launch_orchestration_template(&db, &cfg, "chain", None, None, BTreeMap::new()).await?;
+    let launch = launch_orchestration_template_in_dir(
+        &db,
+        &cfg,
+        "chain",
+        None,
+        None,
+        BTreeMap::new(),
+        root.path(),
+    )
+    .await?;
     assert_eq!(launch.created.len(), 3);
     assert_eq!(db.list_sessions()?.len(), 3);
     assert!(db.template_steps()?.is_empty());
@@ -366,9 +373,16 @@ async fn sequential_chain_fits_one_slot_and_ready_step_waits_for_capacity() -> R
     cfg.max_parallel_worktrees = 0;
     cfg.orchestration_templates.get_mut("chain").unwrap().steps[0].worktree = Some(true);
     let db = StateStore::open(&cfg.db_path)?;
-    let _cwd_guard = crate::test_support::CurrentDirGuard::enter(root.path())?;
-    let launch =
-        launch_orchestration_template(&db, &cfg, "chain", None, None, BTreeMap::new()).await?;
+    let launch = launch_orchestration_template_in_dir(
+        &db,
+        &cfg,
+        "chain",
+        None,
+        None,
+        BTreeMap::new(),
+        root.path(),
+    )
+    .await?;
     assert_eq!(launch.step_count, 3);
     assert_eq!(db.list_sessions()?.len(), 1);
     let a = &launch.created[0].session_id;

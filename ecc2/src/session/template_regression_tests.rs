@@ -533,8 +533,16 @@ async fn sequential_operator_values_match_plain_template_storage_and_display() -
     for step in &mut plain.orchestration_templates.get_mut(value).unwrap().steps {
         step.after.clear();
     }
-    let _cwd_guard = crate::test_support::CurrentDirGuard::enter(root.path())?;
-    let base = launch_orchestration_template(&db, &plain, value, None, None, variables.clone()).await?;
+    let base = launch_orchestration_template_in_dir(
+        &db,
+        &plain,
+        value,
+        None,
+        None,
+        variables.clone(),
+        root.path(),
+    )
+    .await?;
     for (sequential, parallel) in launch.created.iter().zip(&base.created) {
         assert_eq!(sequential.step_name, parallel.step_name);
         assert_eq!(sequential.task, parallel.task);

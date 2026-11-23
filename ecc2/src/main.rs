@@ -15,6 +15,13 @@ pub(crate) mod test_support {
 
     static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    pub(crate) fn lock_current_dir() -> MutexGuard<'static, ()> {
+        CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("current-dir test lock poisoned")
+    }
+
     pub(crate) struct CurrentDirGuard {
         _lock: MutexGuard<'static, ()>,
         original_dir: PathBuf,
