@@ -188,20 +188,33 @@ pub async fn capture_command_output_redacted(
     redactions: Vec<String>,
 ) -> Result<ExitStatus> {
     let db = StateStore::open(&db_path);
-    let child = match db.as_ref() {
+    let mut child = None;
+    let start = match db.as_ref() {
         Ok(db) => db.start_template_harness(&session_id, || {
-            command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .with_context(|| format!("Failed to start process for session {}", session_id))
+            child = Some(
+                command
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .with_context(|| format!("Failed to start process for session {}", session_id))?,
+            );
+            Ok(())
         }),
         Err(error) => Err(anyhow::anyhow!("{error:#}")),
     };
     let db_writer = DbWriter::start(db, session_id.clone());
 
     let result = async {
-        let mut child = child?;
+        if let Err(error) = start {
+            if let Some(mut child) = child {
+                let killed = child.kill().await;
+                let reaped = child.wait().await;
+                killed.context("Failed to terminate uncommitted template harness")?;
+                reaped.context("Failed to reap uncommitted template harness")?;
+            }
+            return Err(error);
+        }
+        let mut child = child.context("Started process did not return a child")?;
 
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,

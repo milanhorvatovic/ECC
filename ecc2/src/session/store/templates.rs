@@ -113,11 +113,11 @@ impl StateStore {
         Ok(())
     }
 
-    pub(crate) fn start_template_harness<T>(
+    pub(crate) fn start_template_harness(
         &self,
         id: &str,
-        spawn: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+        spawn: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let Some(step) = self.template_step(id)? else {
             return spawn();
         };
@@ -149,9 +149,9 @@ impl StateStore {
         if started == 0 {
             anyhow::bail!("Template harness start is no longer available");
         }
-        let child = spawn()?;
+        spawn()?;
         tx.commit()?;
-        Ok(child)
+        Ok(())
     }
 
     pub(crate) fn check_template_session_delete(&self, id: &str) -> Result<()> {
@@ -513,6 +513,7 @@ pub(crate) fn redacted_template_results(
     let mut passed = String::new();
     for (name, text, ring_truncated) in results {
         let text = redact_result_text(text, values);
+        let text = redact_result_text(&text.replace('\0', "\\0"), values);
         let mut start = text.len().saturating_sub(TEMPLATE_RESULT_MAX_BYTES);
         while !text.is_char_boundary(start) {
             start += 1;

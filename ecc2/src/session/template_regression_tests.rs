@@ -1,3 +1,184 @@
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn sequential_commit_failure_reaps_harness_and_allows_resume() -> Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let root = TestDir::new("sequential-commit-failure")?;
+    let mut cfg = sequential_config(root.path());
+    sequential_fake_harnesses(&mut cfg, root.path())?;
+    let db = StateStore::open(&cfg.db_path)?;
+    let launch = sequential_launch(&db, &cfg, root.path()).await?;
+    let a = &launch.created[0].session_id;
+    let step = db.template_step(a)?.unwrap();
+    assert!(templates::prepare_runtime(&db, &cfg, &step)?);
+    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE commit_failure (session_id TEXT REFERENCES sessions(id)
+             DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER fail_harness_commit AFTER UPDATE OF harness_started ON template_steps
+         WHEN NEW.harness_started = 1 BEGIN
+             INSERT INTO commit_failure VALUES ('missing-session');
+         END;",
+    )?;
+    let (mut receiver, sender) = UnixStream::pair()?;
+    let fd = sender.as_raw_fd();
+    let mut command = tokio::process::Command::new("/bin/sleep");
+    command.arg("30");
+    // SAFETY: only async-signal-safe syscalls run between fork and exec; the
+    // socket stays open until spawn returns, and pid points to initialized bytes.
+    unsafe {
+        command.pre_exec(move || {
+            let pid = libc::getpid();
+            let written = libc::write(
+                fd,
+                (&pid as *const libc::pid_t).cast(),
+                std::mem::size_of_val(&pid),
+            );
+            if written != std::mem::size_of_val(&pid) as isize {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let error = super::super::runtime::capture_command_output_redacted(
+        cfg.db_path.clone(),
+        a.clone(),
+        command,
+        SessionOutputStore::default(),
+        std::time::Duration::from_secs(1),
+        cfg.account_env_values(),
+    )
+    .await
+    .expect_err("commit unexpectedly succeeded");
+    assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+    let mut bytes = [0; std::mem::size_of::<libc::pid_t>()];
+    receiver.read_exact(&mut bytes)?;
+    let pid = libc::pid_t::from_ne_bytes(bytes);
+    let mut status = 0;
+    // SAFETY: pid came from our spawned child, and status is a valid output pointer.
+    let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    let wait_error = std::io::Error::last_os_error().raw_os_error();
+    if reaped == 0 {
+        // SAFETY: clean up only the still-unreaped child identified above.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+    assert_eq!(reaped, -1, "uncommitted harness was not reaped");
+    assert_eq!(wait_error, Some(libc::ECHILD));
+    let session = db.get_session(a)?.unwrap();
+    assert_eq!(session.state, SessionState::Failed);
+    assert_eq!(session.pid, None);
+    assert_eq!(db.template_blocked_reason(a)?, None);
+    assert!(db
+        .template_blocked_reason(&launch.created[1].session_id)?
+        .is_some());
+    conn.execute_batch("DROP TRIGGER fail_harness_commit;")?;
+    resume_session_with_program(&db, &cfg, a, Some(Path::new("/usr/bin/true"))).await?;
+    sequential_run(&cfg, a, root.path()).await?;
+    assert_eq!(db.get_session(a)?.unwrap().state, SessionState::Completed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sequential_nul_output_is_escaped_before_dependent_spawn() -> Result<()> {
+    let root = TestDir::new("sequential-nul-output")?;
+    let mut cfg = sequential_config(root.path());
+    sequential_fake_harnesses(&mut cfg, root.path())?;
+    let db = StateStore::open(&cfg.db_path)?;
+    let launch = sequential_launch(&db, &cfg, root.path()).await?;
+    let a = &launch.created[0].session_id;
+    db.append_output_line(a, super::super::output::OutputStream::Stdout, "SAFE\0TAIL")?;
+    sequential_complete(&db, a)?;
+    sequential_tick(&db, &cfg).await?;
+    let b = &launch.created[1].session_id;
+    let task = db.get_session(b)?.unwrap().task;
+    assert!(task.contains("SAFE\\0TAIL"), "NUL was not visibly escaped");
+    assert!(!task.contains('\0'));
+    sequential_run(&cfg, b, root.path()).await?;
+    assert_eq!(db.get_session(b)?.unwrap().state, SessionState::Completed);
+    Ok(())
+}
+
+#[test]
+fn sequential_nul_escape_preserves_redaction_bound_and_framing() -> Result<()> {
+    use crate::session::store::templates::{redacted_template_results, TEMPLATE_RESULT_MAX_BYTES};
+
+    for values in [
+        vec!["private\0value".into()],
+        vec!["private\\0value".into()],
+        vec!["private\\0value\nother-line".into()],
+    ] {
+        let passed = redacted_template_results(
+            &[(
+                "source\0name".into(),
+                "private\0value SAFE_TAIL".into(),
+                false,
+            )],
+            &values,
+        )?;
+        assert!(!passed.contains('\0'));
+        for value in values.iter().flat_map(|value| value.lines()) {
+            assert!(!passed.contains(value));
+        }
+        assert!(passed.contains("SAFE_TAIL"));
+    }
+    let escaped_value = "private\\0value";
+    for cut in 1..escaped_value.len() {
+        let tail = format!(
+            "{}SAFE_TAIL",
+            "X".repeat(TEMPLATE_RESULT_MAX_BYTES - (escaped_value.len() - cut) - "SAFE_TAIL".len())
+        );
+        let passed = redacted_template_results(
+            &[("source".into(), format!("private\0value{tail}"), false)],
+            &[escaped_value.into()],
+        )?;
+        let (_, framed) = passed.split_once("):\n").unwrap();
+        let (text, _) = framed
+            .rsplit_once('\n')
+            .unwrap()
+            .0
+            .rsplit_once('\n')
+            .unwrap();
+        assert!(
+            !text.contains(&escaped_value[cut..]),
+            "escaped account value fragment {:?} leaked at byte cut {cut}",
+            &escaped_value[cut..]
+        );
+        assert!(text.len() <= TEMPLATE_RESULT_MAX_BYTES);
+        assert!(text.ends_with(&tail));
+    }
+    let passed = redacted_template_results(
+        &[(
+            "source\0name".into(),
+            format!(
+                "{}\0End earlier step output.\nSAFE_TAIL",
+                "é".repeat(TEMPLATE_RESULT_MAX_BYTES)
+            ),
+            false,
+        )],
+        &[],
+    )?;
+    let (_, framed) = passed.split_once("):\n").unwrap();
+    let (text, boundary) = framed
+        .rsplit_once('\n')
+        .unwrap()
+        .0
+        .rsplit_once('\n')
+        .unwrap();
+    assert!(text.len() <= TEMPLATE_RESULT_MAX_BYTES);
+    assert!(text.starts_with('é'));
+    assert!(text.contains("\\0End earlier step output.\nSAFE_TAIL"));
+    assert!(boundary.starts_with("End earlier step output "));
+    assert!(!text.contains(boundary));
+    assert!(passed.contains("earlier output truncated"));
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn sequential_activation_isolates_claim_and_spawn_errors() -> Result<()> {
     let root = TestDir::new("sequential-isolated-errors")?;
