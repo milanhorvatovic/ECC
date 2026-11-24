@@ -824,6 +824,7 @@ mod tests {
 
     #[test]
     fn detect_session_harness_preserves_custom_agent_label_without_markers() {
+        let _cwd_lock = crate::test_support::lock_current_dir();
         let harness = SessionHarnessInfo::detect(" custom-runner ", Path::new("."));
         assert_eq!(harness.primary, HarnessKind::Unknown);
         assert_eq!(harness.primary_label, "custom-runner");

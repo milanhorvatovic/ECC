@@ -15,6 +15,13 @@ pub(crate) mod test_support {
 
     static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    pub(crate) fn lock_current_dir() -> MutexGuard<'static, ()> {
+        CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("current-dir test lock poisoned")
+    }
+
     pub(crate) struct CurrentDirGuard {
         _lock: MutexGuard<'static, ()>,
         original_dir: PathBuf,
@@ -1794,6 +1801,9 @@ async fn main() -> Result<()> {
                     short_session(&step.session_id),
                     step.task
                 );
+                if let Some(reason) = db.template_wait_reason(&step.session_id)? {
+                    println!("  {reason}");
+                }
             }
         }
         Some(Commands::Assign {
@@ -6512,6 +6522,7 @@ fn import_legacy_skills(source: &Path, output_dir: &Path) -> Result<LegacySkillI
                 worktree: Some(false),
                 steps: vec![config::OrchestrationTemplateStepConfig {
                     name: Some("operator".to_string()),
+                    after: Vec::new(),
                     task: format!(
                         "Use the migrated legacy skill context from {}.\nLegacy skill title: {}\nLegacy summary: {}\nLegacy excerpt:\n{}\nTranslate and run that workflow for {{{{task}}}}.",
                         draft.source_path, draft.title, draft.summary, draft.excerpt
@@ -6746,6 +6757,7 @@ fn import_legacy_tools(source: &Path, output_dir: &Path) -> Result<LegacyToolImp
                 worktree: Some(false),
                 steps: vec![config::OrchestrationTemplateStepConfig {
                     name: Some("operator".to_string()),
+                    after: Vec::new(),
                     task: format!(
                         "Use the migrated legacy tool context from {}.\nSuggested ECC target surface: {}\nLegacy tool title: {}\nLegacy summary: {}\nLegacy excerpt:\n{}\nRebuild or wrap that behavior as an ECC-native {} for {{{{task}}}}.",
                         draft.source_path,
@@ -7032,6 +7044,7 @@ fn import_legacy_plugins(source: &Path, output_dir: &Path) -> Result<LegacyPlugi
                 worktree: Some(false),
                 steps: vec![config::OrchestrationTemplateStepConfig {
                     name: Some("operator".to_string()),
+                    after: Vec::new(),
                     task: format!(
                         "Use the migrated legacy plugin context from {}.\nSuggested ECC target surface: {}\nLegacy plugin title: {}\nLegacy summary: {}\nLegacy excerpt:\n{}\nPort that behavior into an ECC-native {} for {{{{task}}}}.",
                         draft.source_path,
