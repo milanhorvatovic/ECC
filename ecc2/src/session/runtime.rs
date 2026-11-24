@@ -13,6 +13,7 @@ use super::SessionState;
 
 const ACCOUNT_REDACTION_MARKER: &str = "[REDACTED]";
 
+#[cfg(test)]
 pub(crate) fn redact_account_text(text: &str, values: &[String]) -> String {
     let secrets = values
         .iter()
